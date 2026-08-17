@@ -89,8 +89,21 @@ fn filter_body(body: &str) -> String {
     kept.join("\n")
 }
 
-/// Runs `gh` with the given args, capturing (success, stdout, stderr).
-fn gh_output(args: &[&str]) -> (bool, String, String) {
+/// Heuristic for retryable GitHub/API failures (5xx, timeouts, resets).
+fn is_transient(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("503")
+        || e.contains("502")
+        || e.contains("504")
+        || e.contains("no server is currently available")
+        || e.contains("timeout")
+        || e.contains("timed out")
+        || e.contains("connection reset")
+        || e.contains("temporarily")
+}
+
+/// Runs `gh` once, capturing (success, stdout, stderr).
+fn gh_output_once(args: &[&str]) -> (bool, String, String) {
     match Command::new("gh").args(args).output() {
         Ok(out) => (
             out.status.success(),
@@ -99,6 +112,18 @@ fn gh_output(args: &[&str]) -> (bool, String, String) {
         ),
         Err(e) => (false, String::new(), format!("failed to run gh: {e}")),
     }
+}
+
+/// Runs `gh`, retrying up to 3 times with backoff on transient API failures.
+fn gh_output(args: &[&str]) -> (bool, String, String) {
+    let mut result = gh_output_once(args);
+    let mut attempt = 1u64;
+    while attempt < 3 && !result.0 && is_transient(&result.2) {
+        std::thread::sleep(std::time::Duration::from_millis(500 * attempt));
+        result = gh_output_once(args);
+        attempt += 1;
+    }
+    result
 }
 
 /// Cleans a single PR referenced by `target` (a number/url/branch, or `None`
@@ -116,9 +141,19 @@ fn clean_target(target: Option<&str>, dry: bool, preview: bool, label: Option<&s
     }
     view_args.extend_from_slice(&["--json", "number", "-q", ".number"]);
 
-    let (ok, out, _) = gh_output(&view_args);
+    let (ok, out, err) = gh_output(&view_args);
     let number = out.trim().to_string();
-    if !ok || number.is_empty() {
+    if !ok {
+        // A real API/permission error — surface it instead of pretending the
+        // PR does not exist.
+        eprint!("{err}");
+        match label.or(target) {
+            Some(w) => eprintln!("error: failed to look up pull request '{w}'"),
+            None => eprintln!("error: failed to look up pull request"),
+        }
+        return 1;
+    }
+    if number.is_empty() {
         match label.or(target) {
             Some(w) => eprintln!("error: no pull request found for '{w}' (are you on a PR branch?)"),
             None => eprintln!("error: no pull request found (are you on a PR branch?)"),
@@ -219,18 +254,10 @@ fn cmd_clean_all(args: &[String]) -> i32 {
         i += 1;
     }
 
-    // Resolve the current user so the search works regardless of `@me` support.
-    let (ok, login_out, err) = gh_output(&["api", "user", "-q", ".login"]);
-    let login = login_out.trim().to_string();
-    if !ok || login.is_empty() {
-        eprint!("{err}");
-        eprintln!("error: could not determine the current GitHub user");
-        return 1;
-    }
-
-    let author = format!("--author={login}");
+    // GitHub search understands `@me`, so we avoid depending on the `/user`
+    // endpoint (which some environments/proxies block with a 503).
     let (ok, out, err) = gh_output(&[
-        "search", "prs", "--state=open", &author, "--limit", &limit, "--json", "url", "-q",
+        "search", "prs", "--author=@me", "--state=open", "--limit", &limit, "--json", "url", "-q",
         ".[].url",
     ]);
     if !ok {
@@ -240,11 +267,11 @@ fn cmd_clean_all(args: &[String]) -> i32 {
 
     let urls: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if urls.is_empty() {
-        println!("No open pull requests authored by {login} were found.");
+        println!("No open pull requests authored by you were found.");
         return 0;
     }
 
-    println!("Found {} open PR(s) authored by {login}.", urls.len());
+    println!("Found {} open PR(s) you authored.", urls.len());
     let mut failures = 0;
     for url in urls {
         if clean_target(Some(url), dry, false, Some(url)) != 0 {
@@ -383,5 +410,15 @@ mod tests {
     fn keeps_non_claude_coauthors() {
         let body = "Work.\n\nCo-authored-by: Jane Dev <jane@example.com>";
         assert_eq!(filter_body(body), body);
+    }
+
+    #[test]
+    fn transient_errors_are_detected() {
+        assert!(is_transient(
+            "non-200 OK status code: 503 Service Unavailable"
+        ));
+        assert!(is_transient("No server is currently available"));
+        assert!(!is_transient("HTTP 404: Not Found"));
+        assert!(!is_transient("could not resolve to a PullRequest"));
     }
 }

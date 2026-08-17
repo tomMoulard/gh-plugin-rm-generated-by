@@ -54,9 +54,8 @@ gh plugin-rm-generated-by clean-all --limit 300        # raise the search cap (d
 gh pr view 123 --json body -q .body | gh plugin-rm-generated-by filter
 ```
 
-`clean-all` resolves your GitHub username, finds your open PRs with
-`gh search prs --author=<you> --state=open`, and cleans each one (reporting the
-PR URL, since numbers repeat across repos).
+`clean-all` finds your open PRs with `gh search prs --author=@me --state=open`
+and cleans each one (reporting the PR URL, since numbers repeat across repos).
 
 ## Automatic mode: wrap `gh pr create`
 
