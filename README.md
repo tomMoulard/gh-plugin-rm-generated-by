@@ -45,9 +45,18 @@ gh plugin-rm-generated-by https://github.com/owner/repo/pull/123
 # Preview the result without editing the PR
 gh plugin-rm-generated-by --dry-run
 
+# Clean every open PR you authored, across all repositories
+gh plugin-rm-generated-by clean-all
+gh plugin-rm-generated-by clean-all --dry-run          # preview only
+gh plugin-rm-generated-by clean-all --limit 300        # raise the search cap (default 100)
+
 # Pipe a body through the filter (no API calls) — handy for scripts/CI
 gh pr view 123 --json body -q .body | gh plugin-rm-generated-by filter
 ```
+
+`clean-all` resolves your GitHub username, finds your open PRs with
+`gh search prs --author=<you> --state=open`, and cleans each one (reporting the
+PR URL, since numbers repeat across repos).
 
 ## Automatic mode: wrap `gh pr create`
 

@@ -20,6 +20,8 @@ Usage:
   gh plugin-rm-generated-by                 Clean the current branch's PR
   gh plugin-rm-generated-by <pr>            Clean a specific PR (number/url/branch)
   gh plugin-rm-generated-by --dry-run [pr]  Show what would change, don't edit
+  gh plugin-rm-generated-by clean-all       Clean every open PR you authored (all repos)
+                                            (accepts --dry-run and --limit <n>)
   gh plugin-rm-generated-by create [args]   Run `gh pr create` then clean the new PR
   gh plugin-rm-generated-by filter          Strip trailers from stdin -> stdout
   gh plugin-rm-generated-by shell-init      Print the `gh pr create` middleware fn
@@ -99,6 +101,79 @@ fn gh_output(args: &[&str]) -> (bool, String, String) {
     }
 }
 
+/// Cleans a single PR referenced by `target` (a number/url/branch, or `None`
+/// for the current branch's PR). The same `target` is reused for both reading
+/// and editing so URL-based targets hit the correct repository.
+///
+/// `preview` shows the full rewritten body on `--dry-run` (used for single-PR
+/// runs); `label` overrides the "PR #<n>" prefix in messages (used by
+/// clean-all to print the PR URL, since numbers collide across repos).
+fn clean_target(target: Option<&str>, dry: bool, preview: bool, label: Option<&str>) -> i32 {
+    // Resolve the PR number (defaults to the current branch's PR).
+    let mut view_args: Vec<&str> = vec!["pr", "view"];
+    if let Some(t) = target {
+        view_args.push(t);
+    }
+    view_args.extend_from_slice(&["--json", "number", "-q", ".number"]);
+
+    let (ok, out, _) = gh_output(&view_args);
+    let number = out.trim().to_string();
+    if !ok || number.is_empty() {
+        match label.or(target) {
+            Some(w) => eprintln!("error: no pull request found for '{w}' (are you on a PR branch?)"),
+            None => eprintln!("error: no pull request found (are you on a PR branch?)"),
+        }
+        return 1;
+    }
+    let display = label
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("PR #{number}"));
+
+    let mut body_args: Vec<&str> = vec!["pr", "view"];
+    if let Some(t) = target {
+        body_args.push(t);
+    }
+    body_args.extend_from_slice(&["--json", "body", "-q", ".body"]);
+    let (ok, body_raw, _) = gh_output(&body_args);
+    if !ok {
+        eprintln!("error: failed to read {display} body");
+        return 1;
+    }
+    let body = body_raw.trim_end_matches('\n');
+    let filtered = filter_body(body);
+
+    if filtered == body {
+        println!("{display}: no AI-generated trailer found; nothing to remove.");
+        return 0;
+    }
+
+    if dry {
+        if preview {
+            println!("{display}: would rewrite the description to:");
+            println!("----------8<----------");
+            println!("{filtered}");
+            println!("---------->8----------");
+        } else {
+            println!("{display}: would remove AI-generated trailer (dry-run).");
+        }
+        return 0;
+    }
+
+    let mut edit_args: Vec<&str> = vec!["pr", "edit"];
+    if let Some(t) = target {
+        edit_args.push(t);
+    }
+    edit_args.extend_from_slice(&["--body", &filtered]);
+    let (ok, _, err) = gh_output(&edit_args);
+    if ok {
+        println!("{display}: removed AI-generated trailer from the description.");
+        0
+    } else {
+        eprint!("{err}");
+        1
+    }
+}
+
 fn cmd_clean(args: &[String]) -> i32 {
     let mut dry = false;
     let mut target: Option<&str> = None;
@@ -112,52 +187,75 @@ fn cmd_clean(args: &[String]) -> i32 {
             other => target = Some(other),
         }
     }
+    clean_target(target, dry, true, None)
+}
 
-    // Resolve the PR number (defaults to the current branch's PR).
-    let mut view_args: Vec<&str> = vec!["pr", "view"];
-    if let Some(t) = target {
-        view_args.push(t);
-    }
-    view_args.extend_from_slice(&["--json", "number", "-q", ".number"]);
-
-    let (ok, out, _) = gh_output(&view_args);
-    let number = out.trim().to_string();
-    if !ok || number.is_empty() {
-        match target {
-            Some(t) => eprintln!("error: no pull request found for '{t}' (are you on a PR branch?)"),
-            None => eprintln!("error: no pull request found (are you on a PR branch?)"),
+fn cmd_clean_all(args: &[String]) -> i32 {
+    let mut dry = false;
+    let mut limit = String::from("100");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" | "-n" => dry = true,
+            "--limit" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => limit = v.clone(),
+                    None => {
+                        eprintln!("clean-all: --limit requires a value");
+                        return 2;
+                    }
+                }
+            }
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return 0;
+            }
+            other => {
+                eprintln!("clean-all: unexpected argument '{other}'");
+                return 2;
+            }
         }
-        return 1;
+        i += 1;
     }
 
-    let (ok, body_raw, _) = gh_output(&["pr", "view", &number, "--json", "body", "-q", ".body"]);
-    if !ok {
-        eprintln!("error: failed to read PR #{number} body");
-        return 1;
-    }
-    let body = body_raw.trim_end_matches('\n');
-    let filtered = filter_body(body);
-
-    if filtered == body {
-        println!("PR #{number}: no AI-generated trailer found; nothing to remove.");
-        return 0;
-    }
-
-    if dry {
-        println!("PR #{number}: would rewrite the description to:");
-        println!("----------8<----------");
-        println!("{filtered}");
-        println!("---------->8----------");
-        return 0;
-    }
-
-    let (ok, _, err) = gh_output(&["pr", "edit", &number, "--body", &filtered]);
-    if ok {
-        println!("PR #{number}: removed AI-generated trailer from the description.");
-        0
-    } else {
+    // Resolve the current user so the search works regardless of `@me` support.
+    let (ok, login_out, err) = gh_output(&["api", "user", "-q", ".login"]);
+    let login = login_out.trim().to_string();
+    if !ok || login.is_empty() {
         eprint!("{err}");
+        eprintln!("error: could not determine the current GitHub user");
+        return 1;
+    }
+
+    let author = format!("--author={login}");
+    let (ok, out, err) = gh_output(&[
+        "search", "prs", "--state=open", &author, "--limit", &limit, "--json", "url", "-q",
+        ".[].url",
+    ]);
+    if !ok {
+        eprint!("{err}");
+        return 1;
+    }
+
+    let urls: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if urls.is_empty() {
+        println!("No open pull requests authored by {login} were found.");
+        return 0;
+    }
+
+    println!("Found {} open PR(s) authored by {login}.", urls.len());
+    let mut failures = 0;
+    for url in urls {
+        if clean_target(Some(url), dry, false, Some(url)) != 0 {
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        eprintln!("clean-all: {failures} PR(s) could not be processed.");
         1
+    } else {
+        0
     }
 }
 
@@ -178,7 +276,7 @@ fn cmd_create(args: &[String]) -> i32 {
         return code;
     }
     // `--web` returns before the PR exists; ignore "no PR found" in that case.
-    let _ = cmd_clean(&[]);
+    let _ = clean_target(None, false, false, None);
     0
 }
 
@@ -240,6 +338,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("create") => cmd_create(&args[1..]),
+        Some("clean-all") | Some("all") => cmd_clean_all(&args[1..]),
         Some("filter") => cmd_filter(),
         Some("shell-init") => {
             print!("{SHELL_INIT}");
