@@ -1,0 +1,47 @@
+name: release
+
+# Builds the extension for each platform and attaches the binaries to a GitHub
+# release when a `v*` tag is pushed. `gh extension install <owner>/<repo>` then
+# downloads the asset matching the user's OS/arch (the `<os>-<arch>` suffix).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-amd64
+            ext: ""
+          - os: macos-13
+            platform: darwin-amd64
+            ext: ""
+          - os: macos-14
+            platform: darwin-arm64
+            ext: ""
+          - os: windows-latest
+            platform: windows-amd64
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin="gh-plugin-rm-generated-by${{ matrix.ext }}"
+          cp "target/release/$bin" \
+            "dist/gh-plugin-rm-generated-by_${GITHUB_REF_NAME}_${{ matrix.platform }}${{ matrix.ext }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
