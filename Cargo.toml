@@ -1,0 +1,18 @@
+[package]
+name = "gh-plugin-rm-generated-by"
+version = "0.1.0"
+edition = "2021"
+description = "gh CLI extension that removes AI-generated trailers from PR descriptions"
+license = "MIT"
+repository = "https://github.com/tomMoulard/gh-plugin-rm-generated-by"
+
+[[bin]]
+name = "gh-plugin-rm-generated-by"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

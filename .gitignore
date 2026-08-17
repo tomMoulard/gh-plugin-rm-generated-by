@@ -1,0 +1,3 @@
+/target
+# Local build artifact used for `gh extension install .`
+/gh-plugin-rm-generated-by
