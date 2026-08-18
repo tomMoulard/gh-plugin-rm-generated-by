@@ -86,6 +86,44 @@ Prefer not to override `gh`? Use the explicit wrapper instead:
 gh plugin-rm-generated-by create --fill --base main
 ```
 
+## Automatic mode: Claude Code hook
+
+The shell wrapper only exists in interactive shells. Claude Code's Bash tool
+runs commands non-interactively, so its `gh pr create` calls bypass the
+wrapper entirely and the PR keeps the trailer. Cover that path with a Claude
+Code [PostToolUse hook](https://code.claude.com/docs/en/hooks):
+
+```sh
+gh plugin-rm-generated-by install claude
+```
+
+This registers the hook in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "gh plugin-rm-generated-by claude-hook" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+After every Bash tool call whose command ran `gh pr create` (or `gh pr edit`),
+`claude-hook` pulls the PR URL out of the tool output and strips the trailers.
+When no URL is visible (redirected output), it falls back to the current
+branch's PR in the directory the command ran in. All other Bash calls exit
+immediately, and the hook always exits 0 so it never disrupts the session.
+
+Tip: you can also stop Claude Code from generating the text in the first place
+by setting `"attribution": { "commit": "", "pr": "" }` in
+`~/.claude/settings.json` — the hook then acts as a safety net.
+
 ## What gets removed
 
 A line is dropped when it is any of:

@@ -9,6 +9,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::{exit, Command};
 
+use serde_json::{json, Value};
+
 const USAGE: &str = "\
 gh-plugin-rm-generated-by
 
@@ -26,7 +28,12 @@ Usage:
   gh plugin-rm-generated-by filter          Strip trailers from stdin -> stdout
   gh plugin-rm-generated-by shell-init      Print the `gh pr create` middleware fn
   gh plugin-rm-generated-by install [rc]    Install the middleware into your shell rc
+  gh plugin-rm-generated-by install claude  Install the Claude Code PostToolUse hook
+  gh plugin-rm-generated-by claude-hook     Claude Code hook entrypoint (JSON on stdin)
 ";
+
+/// The hook command registered in Claude Code's settings.json.
+const CLAUDE_HOOK_COMMAND: &str = "gh plugin-rm-generated-by claude-hook";
 
 const SHELL_INIT: &str = r#"# gh plugin-rm-generated-by — strip AI trailers right after `gh pr create`.
 gh() {
@@ -318,7 +325,183 @@ fn cmd_filter() -> i32 {
     0
 }
 
+/// True when a Bash command looks like it created or edited a pull request,
+/// meaning the Claude Code hook should look for a PR to clean.
+fn is_pr_mutation(command: &str) -> bool {
+    command.contains("pr create") || command.contains("pr edit")
+}
+
+fn valid_repo_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+}
+
+/// Extracts unique GitHub pull-request URLs from arbitrary text. Works on raw
+/// JSON hook payloads too, since PR URLs contain no JSON-escaped characters.
+fn extract_pr_urls(text: &str) -> Vec<String> {
+    const HOST: &str = "https://github.com/";
+    let mut urls: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find(HOST) {
+        rest = &rest[pos + HOST.len()..];
+        let mut segs = rest.splitn(4, '/');
+        let owner = segs.next().unwrap_or("");
+        let repo = segs.next().unwrap_or("");
+        let kind = segs.next().unwrap_or("");
+        let number: String = segs
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !owner.is_empty()
+            && owner.chars().all(valid_repo_char)
+            && !repo.is_empty()
+            && repo.chars().all(valid_repo_char)
+            && kind == "pull"
+            && !number.is_empty()
+        {
+            let url = format!("{HOST}{owner}/{repo}/pull/{number}");
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+    }
+    urls
+}
+
+/// Best-effort extraction of the directory a shell command cd'ed into, so the
+/// hook's current-branch fallback runs where `gh pr create` actually ran.
+fn command_cd_dir(command: &str) -> Option<String> {
+    let mut dir = None;
+    for line in command.lines() {
+        if let Some(rest) = line.trim().strip_prefix("cd ") {
+            let arg = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '\'');
+            if !arg.is_empty() {
+                dir = Some(arg.to_string());
+            }
+        }
+    }
+    dir
+}
+
+/// Claude Code PostToolUse hook: reads the hook payload JSON on stdin and,
+/// when the Bash tool just ran a `gh pr create`/`gh pr edit`, cleans the
+/// affected pull request(s). Always exits 0 so a hiccup here never disturbs
+/// the Claude Code session.
+fn cmd_claude_hook() -> i32 {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        return 0;
+    }
+    let payload: Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if payload["tool_name"].as_str() != Some("Bash") {
+        return 0;
+    }
+    let command = payload["tool_input"]["command"].as_str().unwrap_or("");
+    if !is_pr_mutation(command) {
+        return 0;
+    }
+
+    // The created PR's URL shows up in the tool output; scanning the whole
+    // payload keeps this independent of the output field's exact name, which
+    // has drifted across Claude Code versions.
+    let urls = extract_pr_urls(&input);
+    if urls.is_empty() {
+        // Output was swallowed (redirect, --web, ...): fall back to the
+        // current branch's PR, preferring a directory the command cd'ed into.
+        let dir = command_cd_dir(command)
+            .or_else(|| payload["cwd"].as_str().map(str::to_string));
+        if let Some(dir) = dir {
+            let _ = env::set_current_dir(dir);
+        }
+        let _ = clean_target(None, false, false, None);
+        return 0;
+    }
+    for url in &urls {
+        let _ = clean_target(Some(url), false, false, Some(url));
+    }
+    0
+}
+
+/// Returns the settings JSON with the PostToolUse hook appended, `None` when
+/// the hook is already registered, or an error message when the file cannot
+/// be safely rewritten.
+fn settings_with_hook(settings: &str) -> Result<Option<String>, String> {
+    let mut root: Value = serde_json::from_str(settings).map_err(|e| e.to_string())?;
+    let obj = root
+        .as_object_mut()
+        .ok_or("settings root is not a JSON object")?;
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("\"hooks\" is not a JSON object")?;
+    let post = hooks
+        .entry("PostToolUse")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or("\"hooks.PostToolUse\" is not a JSON array")?;
+
+    let installed = post.iter().any(|entry| {
+        entry["hooks"].as_array().is_some_and(|hs| {
+            hs.iter()
+                .any(|h| h["command"].as_str().unwrap_or("").contains(CLAUDE_HOOK_COMMAND))
+        })
+    });
+    if installed {
+        return Ok(None);
+    }
+
+    post.push(json!({
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+    }));
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    Ok(Some(out + "\n"))
+}
+
+/// Registers the PostToolUse hook in ~/.claude/settings.json so Claude Code
+/// sessions clean every PR their Bash tool creates or edits with `gh`.
+fn cmd_install_claude() -> i32 {
+    let home = env::var("HOME").unwrap_or_default();
+    let dir = format!("{home}/.claude");
+    let path = format!("{dir}/settings.json");
+    let existing = fs::read_to_string(&path).unwrap_or_else(|_| String::from("{}"));
+    let updated = match settings_with_hook(&existing) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!("Claude Code hook already installed in {path}");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("error: cannot update {path}: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("error: failed to create {dir}: {e}");
+        return 1;
+    }
+    if let Err(e) = fs::write(&path, updated) {
+        eprintln!("error: failed to write {path}: {e}");
+        return 1;
+    }
+    println!("Installed the Claude Code PostToolUse hook into {path}");
+    println!("Claude Code will now clean every PR its Bash tool creates with `gh pr create`.");
+    0
+}
+
 fn cmd_install(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("claude") {
+        return cmd_install_claude();
+    }
     let rc = match args.first() {
         Some(path) => path.clone(),
         None => {
@@ -366,6 +549,7 @@ fn main() {
     let code = match args.first().map(String::as_str) {
         Some("create") => cmd_create(&args[1..]),
         Some("clean-all") | Some("all") => cmd_clean_all(&args[1..]),
+        Some("claude-hook") => cmd_claude_hook(),
         Some("filter") => cmd_filter(),
         Some("shell-init") => {
             print!("{SHELL_INIT}");
@@ -410,6 +594,66 @@ mod tests {
     fn keeps_non_claude_coauthors() {
         let body = "Work.\n\nCo-authored-by: Jane Dev <jane@example.com>";
         assert_eq!(filter_body(body), body);
+    }
+
+    #[test]
+    fn extracts_pr_urls_from_raw_hook_payload() {
+        let payload = r#"{"tool_name":"Bash","tool_output":"https://github.com/SynthFlowAI/orchestrator/pull/1978\nexit=0"}"#;
+        assert_eq!(
+            extract_pr_urls(payload),
+            vec!["https://github.com/SynthFlowAI/orchestrator/pull/1978"]
+        );
+    }
+
+    #[test]
+    fn deduplicates_and_rejects_non_pr_urls() {
+        let text = "see https://github.com/o/r/pull/7 and https://github.com/o/r/pull/7,\n\
+                    plus https://github.com/o/r/issues/9 and https://github.com/o/r";
+        assert_eq!(extract_pr_urls(text), vec!["https://github.com/o/r/pull/7"]);
+    }
+
+    #[test]
+    fn detects_pr_mutation_commands() {
+        assert!(is_pr_mutation(
+            "cd /tmp/wt\ngh pr create --base main --body-file /tmp/body.md"
+        ));
+        assert!(is_pr_mutation("gh pr edit 123 --body 'x'"));
+        assert!(!is_pr_mutation("gh pr view 123 --json body"));
+        assert!(!is_pr_mutation("git push origin main"));
+    }
+
+    #[test]
+    fn finds_the_last_cd_directory() {
+        let cmd = "cd /a/b\ngh pr create";
+        assert_eq!(command_cd_dir(cmd), Some("/a/b".to_string()));
+        let cmd = "cd \"/x/y\" && gh pr edit 1 --body hi";
+        assert_eq!(command_cd_dir(cmd), Some("/x/y".to_string()));
+        assert_eq!(command_cd_dir("gh pr create"), None);
+    }
+
+    #[test]
+    fn installs_hook_into_empty_settings() {
+        let out = settings_with_hook("{}").unwrap().unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hooks"]["PostToolUse"][0]["matcher"], "Bash");
+        assert_eq!(
+            v["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            CLAUDE_HOOK_COMMAND
+        );
+    }
+
+    #[test]
+    fn hook_install_is_idempotent_and_preserves_settings() {
+        let existing = r#"{"model": "opus", "hooks": {"PostToolUse": [
+            {"matcher": "Write", "hooks": [{"type": "command", "command": "fmt"}]}
+        ]}}"#;
+        let out = settings_with_hook(existing).unwrap().unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["model"], "opus");
+        assert_eq!(v["hooks"]["PostToolUse"][0]["matcher"], "Write");
+        assert_eq!(v["hooks"]["PostToolUse"][1]["matcher"], "Bash");
+        // A second install is a no-op.
+        assert_eq!(settings_with_hook(&out).unwrap(), None);
     }
 
     #[test]

@@ -6,6 +6,11 @@ description = "gh CLI extension that removes AI-generated trailers from PR descr
 license = "MIT"
 repository = "https://github.com/tomMoulard/gh-plugin-rm-generated-by"
 
+[dependencies]
+# preserve_order keeps the user's settings.json key order intact when the
+# Claude Code hook installer rewrites the file.
+serde_json = { version = "1", features = ["preserve_order"] }
+
 [[bin]]
 name = "gh-plugin-rm-generated-by"
 path = "src/main.rs"
