@@ -61,6 +61,10 @@ fn is_trailer(line: &str) -> bool {
     if low.contains("generated with") && low.contains("claude code") {
         return true;
     }
+    // "https://claude.ai/code/session_..." (bare link or "Claude-Session:" trailer)
+    if low.contains("claude.ai/code/session_") {
+        return true;
+    }
     // "Co-authored-by: Claude/Anthropic ..."
     let t = low.trim_start();
     t.starts_with("co-authored-by:") && (t.contains("claude") || t.contains("anthropic"))
@@ -69,17 +73,27 @@ fn is_trailer(line: &str) -> bool {
 /// Strips AI-generated trailer lines from a PR body. When something is removed,
 /// trailing blank lines and a dangling horizontal rule (--- / *** / ___) left
 /// behind by the trailer are trimmed too. If nothing matches, the body is
-/// returned unchanged.
+/// returned unchanged. A trailer in the middle of the body (for example
+/// before a bot-appended footer) leaves a single blank line, not a run of them.
 fn filter_body(body: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut deleted = false;
+    let mut after_trailer = false;
 
     for line in body.split('\n') {
         if is_trailer(line) {
             deleted = true;
-        } else {
-            kept.push(line);
+            after_trailer = true;
+            continue;
         }
+        let blank = line.trim().is_empty();
+        if after_trailer && blank && kept.last().is_none_or(|l| l.trim().is_empty()) {
+            continue;
+        }
+        if !blank {
+            after_trailer = false;
+        }
+        kept.push(line);
     }
 
     if deleted {
@@ -582,6 +596,23 @@ mod tests {
     fn removes_dangling_horizontal_rule() {
         let body = "Fix the flaky test.\n\n---\n🤖 Generated with [Claude Code](https://claude.com/claude-code)";
         assert_eq!(filter_body(body), "Fix the flaky test.");
+    }
+
+    #[test]
+    fn removes_claude_session_link_before_a_bot_footer() {
+        // Shape of SynthFlowAI/live-environments#1983: the session link sits
+        // mid-body because CodeRabbit appended its release notes after it.
+        let body = "Used by o/r#2437, which gives the merge order.\n\nhttps://claude.ai/code/session_019YHKKdUevBLhLY1PbHjAej\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->";
+        assert_eq!(
+            filter_body(body),
+            "Used by o/r#2437, which gives the merge order.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->"
+        );
+    }
+
+    #[test]
+    fn removes_claude_session_trailer_at_the_end() {
+        let body = "Fix it.\n\nClaude-Session: https://claude.ai/code/session_ABC123\n";
+        assert_eq!(filter_body(body), "Fix it.");
     }
 
     #[test]
